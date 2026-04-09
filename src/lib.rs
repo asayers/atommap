@@ -1,8 +1,35 @@
-/*! A convenient, safe, and performant API for atomic file I/O
+/*! Safe `mmap()` with **snapshot isolation** and **atomic commits**
 
-With [`Atommap`], `open()` and `commit()` are fully atomic (and constant-time); but it only works on reflink-enabled filesystems (XFS, btrfs, bcachefs, ZFS).
-[`Mmap`] works on any filesystem, but `open()` and `commit()` may not be atomic, and might be O(n) in the size of the file.
+It comes in two flavours:
 
+* [`Atommap`]: `open()` and `commit()` are fully atomic (and constant-time),
+    but it only works on reflink-enabled filesystems (XFS, btrfs, bcachefs, ZFS).
+* [`Mmap`]: works on any filesystem,
+    but `open()` and `commit()` may not be atomic,
+    and might be O(n) in the size of the file.
+
+Both are Linux-only.
+
+## Example
+
+```rust
+# fn foo() -> std::io::Result<()> {
+# let path = std::path::Path::new("/var/tmp/foo");
+std::fs::write(&path, b"Hello world!")?;
+let mut f = atommap::Atommap::open(&path)?;
+f.as_mut()[6..11].copy_from_slice(b"sekai");
+f.commit()?;
+assert_eq!(std::fs::read_to_string(&path)?, "Hello sekai!");
+# Ok(())
+# }
+```
+
+## Performance
+
+`Atommap::open()` takes a bit longer than `File::open()` (0.1 ms longer on my
+machine, although this may depend on filesystem; I'm using XFS).  This is a
+one-time cost, and once it's paid there appears to be no performance impact -
+ie. it's the same as `pread()`/`pwrite()`/`mmap()` without snapshot isolation.
 */
 
 use rustix::{
