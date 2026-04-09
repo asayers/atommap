@@ -1,3 +1,5 @@
+/*! A convenient, safe, and performant API for atomic file I/O */
+
 use rustix::{
     fs::{Mode, OFlags, copy_file_range, ftruncate, ioctl_ficlone, open},
     io::Errno,
@@ -11,6 +13,30 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// A snapshot of a file
+///
+/// ## Reading
+///
+/// Read the file contents using the `AsRef` impl.  The data you see will
+/// reflect the state of the file at the time `open()` was called; writes by other
+/// process are not reflected.  In other words, `Atommap` will show you a consistent
+/// point-in-time snapshot of the file.
+///
+/// Data is not loaded eagerly into memory.  It will be read in from disk on demand.
+/// For this we rely on the COW capabilities of the underlying filesystem.
+///
+/// ## Writing
+///
+/// Write the file contents using the `AsMut` impl.  Writes will be immediately
+/// visible to you (when you read this `Atommap`), but will not be visible to
+/// other processes reading the file until you call `commit()`.  Once you
+/// call commit, all your modifications will be atomically visible to other
+/// readers.
+///
+/// Modifications are being written back to disk all the time (asynchronously
+/// by the kernel), so there may be very little I/O left to do when you actually
+/// call `commit()`.  "Committing" simply makes the written changes visible
+/// (after waiting for writeback to complete).
 pub struct Atommap {
     original: File,
     private: File,    // Unlinked; initially a clone of `original`
@@ -44,6 +70,7 @@ fn ficlone_with_fallback(fd_in: impl AsFd, fd_out: impl AsFd, len: usize) -> io:
 }
 
 impl Atommap {
+    /// Take a snapshot of the file and map it into memory
     pub fn open(path: PathBuf) -> io::Result<Self> {
         let original = File::options().read(true).write(true).open(&path)?;
         let len = original.metadata()?.len() as usize;
@@ -70,6 +97,7 @@ impl Atommap {
         }
     }
 
+    /// Replace the original file with the contents of the snapshot
     pub fn commit(&mut self) -> io::Result<()> {
         unsafe {
             msync(self.ptr, self.len, MsyncFlags::SYNC)?;
@@ -78,6 +106,7 @@ impl Atommap {
         Ok(())
     }
 
+    /// Change the size of the file.  If extending, the extension is filled with zeroes.
     pub fn resize(&mut self, new_len: usize) -> io::Result<()> {
         ftruncate(&self.private, new_len as u64)?;
         unsafe {
