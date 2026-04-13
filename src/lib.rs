@@ -169,6 +169,7 @@ impl Mmap {
         let path = path.as_ref();
         let original = File::options().read(true).write(true).open(path)?;
         let len = original.metadata()?.len() as usize;
+        assert!(len < isize::MAX as usize);
         let dir = path.parent().unwrap_or(Path::new("."));
         let private: File =
             open(dir, OFlags::TMPFILE | OFlags::RDWR, Mode::RUSR | Mode::WUSR)?.into();
@@ -295,9 +296,11 @@ impl Mmap {
 
     /// Change the size of the file.  If extending, the extension is filled with zeroes.
     pub fn resize(&mut self, new_len: usize) -> io::Result<()> {
+        assert!(new_len < isize::MAX as usize);
         ftruncate(&self.private, new_len as u64)?;
         unsafe {
             self.ptr = mremap(self.ptr, self.len, new_len, MremapFlags::MAYMOVE)?;
+            assert!(!self.ptr.is_null());
         }
         self.len = new_len;
         Ok(())
@@ -319,11 +322,9 @@ impl AsMut<[u8]> for Mmap {
 impl Drop for Mmap {
     fn drop(&mut self) {
         unsafe {
-            if !self.ptr.is_null() {
-                match munmap(self.ptr, self.len) {
-                    Ok(()) => (),
-                    Err(e) => eprintln!("munmap failed: {e}"),
-                }
+            match munmap(self.ptr, self.len) {
+                Ok(()) => (),
+                Err(e) => eprintln!("munmap failed: {e}"),
             }
         }
     }
