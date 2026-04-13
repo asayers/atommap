@@ -1,12 +1,12 @@
 [package]
-name = "atommap"
-description = "Safe and atomic mmap"
+name = "mmap-snapshot"
+description = "Safe mmap with snapshot isolation and atomic commits"
 version = "0.1.0"
 edition = "2024"
 authors = ["Alex Sayers <alex@asayers.com>"]
 license = "Unlicense"
 readme = "README.md"
-repository = "https://github.com/asayers/atommap"
+repository = "https://github.com/asayers/mmap-snapshot"
 
 [dependencies]
 rustix = { version = "1.1.4", features = ["fs", "mm"] }

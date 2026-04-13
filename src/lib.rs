@@ -13,12 +13,14 @@ Both are Linux-only.
 ## Example
 
 ```rust
+# use mmap_snapshot::Mmap;
 # fn foo() -> std::io::Result<()> {
-# let path = std::path::Path::new("/var/tmp/foo");
-std::fs::write(&path, b"Hello world!")?;
-let mut f = atommap::Atommap::open(&path)?;
-f.as_mut()[6..11].copy_from_slice(b"sekai");
-f.commit()?;
+# let path = std::path::Path::new("/tmp/foo");
+# std::fs::write(&path, b"Hello world!")?;
+let mut mmap = Mmap::open(&path)?;
+assert_eq!(mmap.as_ref(), b"Hello world!");
+mmap.as_mut()[6..11].copy_from_slice(b"sekai");
+mmap.commit()?;
 assert_eq!(std::fs::read_to_string(&path)?, "Hello sekai!");
 # Ok(())
 # }

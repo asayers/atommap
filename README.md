@@ -1,4 +1,4 @@
-<h1 align="center">Atommap</h1>
+<h1 align="center">mmap-snapshot</h1>
 
 Safe `mmap()` for Rust, with snapshot isolation and atomic commits.
 (Linux-only, works best on XFS/btrfs.)
