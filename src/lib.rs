@@ -1,4 +1,5 @@
 #![warn(missing_docs)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 /*! **Safe** `mmap()` with **snapshot isolation** and **atomic commits**.
 
@@ -144,7 +145,12 @@ pub struct Mmap {
     path: Option<PathBuf>,
 }
 
+// SAFETY:
+// All members of `Mmap` implement Send except for `ptr`.  `ptr`+`len` are just
+// "plain old memory" (that's the point of the trick with the private unlinked
+// file.)  So they have the same properties as Box<[u8]> wrt Send/Sync.
 unsafe impl Send for Mmap {}
+// SAFETY: See above
 unsafe impl Sync for Mmap {}
 
 impl Mmap {
@@ -177,22 +183,23 @@ impl Mmap {
 
         // SAFETY:
         // > If `ptr` is not null, it must be aligned...
+        //
         // `ptr` is null.
         //
-        // > If there exist any Rust references referring to the memory region, or if
-        // > you subsequently create a Rust reference referring to the resulting region,
+        // > If there exist any Rust references referring to the memory region
+        //
+        // We're letting the kernel pick an unused region so there shouldn't be any.
+        //
+        // > or if you subsequently create a Rust reference referring to the
+        // > resulting region,
+        //
+        // We will be doing this.
+        //
         // > it is your responsibility to ensure that the Rust reference invariants are
         // > preserved, including ensuring that the memory is not mutated in a way that
         // > a Rust reference would not expect.
         //
-        // I believe this is satified if the the only way to mutate the memory
-        // is via this Mmap's `AsMut` impl.  The other way this memory could be
-        // mutated is by modifications to the file. Since the file was created
-        // with O_TMPFILE, it's impossible to create a new fd for the file via
-        // the filesystem. And since we never expose our fd, it's impossible to
-        // create a new fd via clone().  Therefore we hold the only fd. So long
-        // as _we_ don't modify the file via that fd (which we don't), the file
-        // can only be modified via the mmap. This satisfies the requirements.
+        // See the safety comment in the AsMut impl.
         let ptr = unsafe {
             mmap(
                 std::ptr::null_mut(),
@@ -287,6 +294,10 @@ impl Mmap {
 
     fn sync(&self) -> io::Result<()> {
         if self.len != 0 {
+            // SAFETY:
+            // `self.ptr` is the (non-null) pointer we got from `mmap()`, and
+            // `self.len` is the length we passed to `mmap()`, so together these
+            // describe an mmapped region and are safe to pass to `msync()`
             unsafe {
                 msync(self.ptr, self.len, MsyncFlags::SYNC)?;
             }
@@ -298,6 +309,30 @@ impl Mmap {
     pub fn resize(&mut self, new_len: usize) -> io::Result<()> {
         assert!(new_len < isize::MAX as usize);
         ftruncate(&self.private, new_len as u64)?;
+        // SAFETY:
+        // > `self.ptr` must be aligned to the applicable page size, and the range of
+        // > memory starting at `self.ptr` and extending for `self.len` bytes,
+        // > rounded up to the applicable page size, must be valid to mutate with
+        // > `self.ptr`'s provenance.
+        //
+        // `self.ptr` comes from an mmap with length `self.len`, so this should
+        // all hold.
+        //
+        // > If `MremapFlags::MAY_MOVE` is set in `flags`,
+        // > there must be no Rust references referring to that the memory.
+        //
+        // This flag is set, so `mremap()` might move the mapping to a
+        // completely new address. The only way to get references to the mapping
+        // is via the AsRef/AsMut impls, which take borrows on the `Mmap`. Since
+        // this method takes `&mut self`, we know that no such references are
+        // live.
+        //
+        // > If `new_len` is less than `self.len`, than there must be no Rust
+        // > references referring to the memory starting at offset `new_len` and ending
+        // > at `self.len`.
+        //
+        // As per the above, there are no live references at all into the
+        // mapping.
         unsafe {
             self.ptr = mremap(self.ptr, self.len, new_len, MremapFlags::MAYMOVE)?;
             assert!(!self.ptr.is_null());
@@ -309,18 +344,83 @@ impl Mmap {
 
 impl AsRef<[u8]> for Mmap {
     fn as_ref(&self) -> &[u8] {
+        // SAFETY: See the `AsMut` impl.
         unsafe { core::slice::from_raw_parts(self.ptr as *const u8, self.len) }
     }
 }
 
 impl AsMut<[u8]> for Mmap {
     fn as_mut(&mut self) -> &mut [u8] {
+        // SAFETY:
+        // > `ptr` must be valid for both reads and writes for `len * size_of::<T>()` many bytes
+        // >  ... The entire memory range of this slice must be contained within a single allocation!
+        //
+        // The whole range comes from a single call to `mmap()`.
+        //
+        // > `ptr` must be non-null
+        //
+        // `ptr` is asserted to be non-null wherever it is modified (`open()`
+        // and `resize()`).
+        //
+        // >   * `ptr` must be properly aligned
+        //
+        // The element type is `u8`, so `ptr` is trivially aligned.
+        //
+        // > `ptr` must point to `len` consecutive properly initialized values of type `u8`.
+        //
+        // File-backed VMAs count as initialized.  There's no such thing as a
+        // file which contains uninitialised bytes.  (Event sparse regions are
+        // well-defined as containing zeroes.)
+        //
+        // > The memory referenced by the returned slice must not be accessed
+        // > through any other pointer (not derived from the return value) for
+        // > the duration of lifetime `'a`. Both read and write accesses are
+        // > forbidden.
+        //
+        // This is the big one.  I believe this is satisfied if both of the
+        // following hold true:
+        //
+        // * the only way to mutate the memory is via this `AsMut` impl
+        // * the only way to read the memory is via this `AsMut` impl or the `AsRef` impl
+        //
+        // This memory can be accessed via these impls of course, and also via operations on the underlying file.
+        // Howver, we can be sure that no such file operations will take place.
+        // That's because:
+        //
+        // * The file was created with `O_TMPFILE`, which means it's impossible
+        //   to create a new fd for the file via the filesystem.
+        // * We never expose our fd, which means it's impossible to create a new
+        //   fd via `clone()`.
+        // * Therefore the _only_ fd referencing the underlying file is `self.fd`.
+        // * We don't access the file via that fd while `'a` is live (in fact,
+        //   the only use is in the `Drop` impl, where we call `close()` on it).
+        // * Therefore the memory can only be accessed via the mmap
+        //
+        // > The total size `len * size_of::<T>()` of the slice must be no larger than `isize::MAX`,
+        // > and adding that size to `ptr` must not "wrap around" the address space.
+        // > See the safety documentation of [`pointer::offset`].
+        //
+        // `mmap()` puts the mapping somewhere where it fits, so
+        // `self.ptr.add(self.len)` will never overflow the address space.
+        // `self.len < isize::MAX` is asserted in open() and resize().
         unsafe { core::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
     }
 }
 
 impl Drop for Mmap {
     fn drop(&mut self) {
+        // SAFETY:
+        // > `ptr` must be aligned to the applicable page size, and the range of memory
+        // > starting at `ptr` and extending for `len` bytes, rounded up to the
+        // > applicable page size, must be valid to mutate with `ptr`'s provenance.
+        //
+        // `self.ptr` comes from an mmap with length `self.len`.
+        //
+        // > And there must be no Rust references referring to that memory.
+        //
+        // The only way to get references to the mapping is via the AsRef/AsMut
+        // impls, which take borrows on the `Mmap`.  Since this method takes
+        // `&mut self`, we know that no such references are live.
         unsafe {
             match munmap(self.ptr, self.len) {
                 Ok(()) => (),
