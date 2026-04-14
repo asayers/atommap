@@ -1,4 +1,5 @@
 #![warn(missing_docs)]
+#![warn(clippy::missing_safety_doc)]
 
 /*! **Safe** `mmap()` with **snapshot isolation** and **atomic commits**.
 
@@ -99,9 +100,10 @@ fn ficlone(fd_out: impl AsFd, fd_in: impl AsFd, len: usize) -> io::Result<bool> 
                 if n == 0 {
                     Err(io::ErrorKind::UnexpectedEof)?;
                 }
-                if n > rem {
-                    panic!()
-                }
+                assert!(
+                    n <= rem,
+                    "copy_file_range returned more bytes than requested"
+                );
                 rem -= n;
             }
             Ok(true)
@@ -286,6 +288,8 @@ impl Mmap {
 
     fn sync(&self) -> io::Result<()> {
         if self.len != 0 {
+            // SAFETY: The pointer and length are valid as they were initialized in `open`
+            // and are only invalidated in `drop`.
             unsafe {
                 msync(self.ptr, self.len, MsyncFlags::SYNC)?;
             }
@@ -296,6 +300,8 @@ impl Mmap {
     /// Change the size of the file.  If extending, the extension is filled with zeroes.
     pub fn resize(&mut self, new_len: usize) -> io::Result<()> {
         ftruncate(&self.private, new_len as u64)?;
+        // SAFETY: `mremap` is safe here as it updates the mapping owned by `Mmap`.
+        // The `MAYMOVE` flag allows the kernel to relocate the mapping.
         unsafe {
             self.ptr = mremap(self.ptr, self.len, new_len, MremapFlags::MAYMOVE)?;
         }
@@ -306,18 +312,23 @@ impl Mmap {
 
 impl AsRef<[u8]> for Mmap {
     fn as_ref(&self) -> &[u8] {
+        // SAFETY: The memory region is valid and initialized for the duration of the slice.
         unsafe { core::slice::from_raw_parts(self.ptr as *const u8, self.len) }
     }
 }
 
 impl AsMut<[u8]> for Mmap {
     fn as_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `&mut self` ensures exclusive access in Rust, and the use of `O_TMPFILE`
+        // ensures that no other process can modify the underlying file.
         unsafe { core::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
     }
 }
 
 impl Drop for Mmap {
     fn drop(&mut self) {
+        // SAFETY: We are unmapping the region using the same pointer and length
+        // that were used to create the mapping in `open`.
         unsafe {
             if !self.ptr.is_null() {
                 match munmap(self.ptr, self.len) {
