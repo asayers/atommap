@@ -1,4 +1,5 @@
 #![warn(missing_docs)]
+#![warn(clippy::missing_safety_doc)]
 
 /*! **Safe** `mmap()` with **snapshot isolation** and **atomic commits**.
 
