@@ -96,17 +96,23 @@ fn ficlone(fd_out: impl AsFd, fd_in: impl AsFd, len: usize) -> io::Result<bool> 
     match ioctl_ficlone(&fd_out, &fd_in) {
         Ok(()) => Ok(false),
         Err(Errno::OPNOTSUPP) => {
-            let mut rem = len;
-            while rem > 0 {
-                let n = copy_file_range(&fd_in, None, &fd_out, None, rem)?;
+            ftruncate(&fd_out, len as u64)?;
+            let mut off_in = 0;
+            let mut off_out = 0;
+            while off_in < len as u64 {
+                let rem = len - off_in as usize;
+                let n =
+                    copy_file_range(&fd_in, Some(&mut off_in), &fd_out, Some(&mut off_out), rem)?;
+                assert_eq!(off_in, off_out);
+                assert!(
+                    n <= rem,
+                    "copy_file_range() copied more bytes than requested"
+                );
                 if n == 0 {
                     Err(io::ErrorKind::UnexpectedEof)?;
                 }
-                if n > rem {
-                    panic!()
-                }
-                rem -= n;
             }
+            assert_eq!(off_out, len as u64);
             Ok(true)
         }
         Err(e) => Err(e.into()),
