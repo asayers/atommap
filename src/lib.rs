@@ -183,36 +183,41 @@ impl Mmap {
             open(dir, OFlags::TMPFILE | OFlags::RDWR, Mode::RUSR | Mode::WUSR)?.into();
         let fellback = ficlone(&private, &original, len)?;
 
-        // SAFETY:
-        // > If `ptr` is not null, it must be aligned...
-        //
-        // `ptr` is null.
-        //
-        // > If there exist any Rust references referring to the memory region
-        //
-        // We're letting the kernel pick an unused region so there shouldn't be any.
-        //
-        // > or if you subsequently create a Rust reference referring to the
-        // > resulting region,
-        //
-        // We will be doing this.
-        //
-        // > it is your responsibility to ensure that the Rust reference invariants are
-        // > preserved, including ensuring that the memory is not mutated in a way that
-        // > a Rust reference would not expect.
-        //
-        // See the safety comment in the DerefMut impl.
-        let ptr = unsafe {
-            mmap(
-                std::ptr::null_mut(),
-                len,
-                ProtFlags::READ | ProtFlags::WRITE,
-                MapFlags::SHARED,
-                &private,
-                0,
-            )?
+        let ptr;
+        if len == 0 {
+            ptr = std::ptr::null_mut();
+        } else {
+            // SAFETY:
+            // > If `ptr` is not null, it must be aligned...
+            //
+            // `ptr` is null.
+            //
+            // > If there exist any Rust references referring to the memory region
+            //
+            // We're letting the kernel pick an unused region so there shouldn't be any.
+            //
+            // > or if you subsequently create a Rust reference referring to the
+            // > resulting region,
+            //
+            // We will be doing this.
+            //
+            // > it is your responsibility to ensure that the Rust reference invariants are
+            // > preserved, including ensuring that the memory is not mutated in a way that
+            // > a Rust reference would not expect.
+            //
+            // See the safety comment in the DerefMut impl.
+            unsafe {
+                ptr = mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    ProtFlags::READ | ProtFlags::WRITE,
+                    MapFlags::SHARED,
+                    &private,
+                    0,
+                )?;
+            }
         };
-        assert!(!ptr.is_null());
+        assert!(ptr.is_null() == (len == 0));
         Ok(Self {
             original,
             private,
@@ -297,9 +302,13 @@ impl Mmap {
     fn sync(&self) -> io::Result<()> {
         if self.len != 0 {
             // SAFETY:
-            // `self.ptr` is the (non-null) pointer we got from `mmap()`, and
-            // `self.len` is the length we passed to `mmap()`, so together these
-            // describe an mmapped region and are safe to pass to `msync()`
+            // > `addr` must be a valid pointer to memory that is appropriate to call
+            // > `msync` on.
+            //
+            // Given that len is non-zero, `self.ptr` is a pointer which
+            // came from `mmap()`, and `self.len` is the length we passed to
+            // `mmap()`, so together these describe an mmapped region and are
+            // safe to pass to `msync()`.
             unsafe {
                 msync(self.ptr, self.len, MsyncFlags::SYNC)?;
             }
@@ -310,36 +319,59 @@ impl Mmap {
     /// Change the size of the file.  If extending, the extension is filled with zeroes.
     pub fn resize(&mut self, new_len: usize) -> io::Result<()> {
         assert!(new_len < isize::MAX as usize);
+        if new_len == self.len {
+            return Ok(());
+        }
         ftruncate(&self.private, new_len as u64)?;
-        // SAFETY:
-        // > `self.ptr` must be aligned to the applicable page size, and the range of
-        // > memory starting at `self.ptr` and extending for `self.len` bytes,
-        // > rounded up to the applicable page size, must be valid to mutate with
-        // > `self.ptr`'s provenance.
-        //
-        // `self.ptr` comes from an mmap with length `self.len`, so this should
-        // all hold.
-        //
-        // > If `MremapFlags::MAY_MOVE` is set in `flags`,
-        // > there must be no Rust references referring to that the memory.
-        //
-        // This flag is set, so `mremap()` might move the mapping to a
-        // completely new address. The only way to get references to the mapping
-        // is via the Deref/DerefMut impls, which take borrows on the `Mmap`. Since
-        // this method takes `&mut self`, we know that no such references are
-        // live.
-        //
-        // > If `new_len` is less than `self.len`, than there must be no Rust
-        // > references referring to the memory starting at offset `new_len` and ending
-        // > at `self.len`.
-        //
-        // As per the above, there are no live references at all into the
-        // mapping.
-        unsafe {
-            self.ptr = mremap(self.ptr, self.len, new_len, MremapFlags::MAYMOVE)?;
-            assert!(!self.ptr.is_null());
+        if new_len == 0 {
+            // SAFETY: See the Drop impl
+            unsafe {
+                munmap(self.ptr, self.len)?;
+            }
+            self.ptr = std::ptr::null_mut();
+        } else if self.len == 0 {
+            // SAFETY: See Mmap::open()
+            unsafe {
+                self.ptr = mmap(
+                    std::ptr::null_mut(),
+                    new_len,
+                    ProtFlags::READ | ProtFlags::WRITE,
+                    MapFlags::SHARED,
+                    &self.private,
+                    0,
+                )?;
+            }
+        } else {
+            // SAFETY:
+            // > `self.ptr` must be aligned to the applicable page size, and the range of
+            // > memory starting at `self.ptr` and extending for `self.len` bytes,
+            // > rounded up to the applicable page size, must be valid to mutate with
+            // > `self.ptr`'s provenance.
+            //
+            // `self.ptr` comes from an mmap with length `self.len`, so this should
+            // all hold.
+            //
+            // > If `MremapFlags::MAY_MOVE` is set in `flags`,
+            // > there must be no Rust references referring to that the memory.
+            //
+            // This flag is set, so `mremap()` might move the mapping to a
+            // completely new address. The only way to get references to the mapping
+            // is via the Deref/DerefMut impls, which take borrows on the `Mmap`. Since
+            // this method takes `&mut self`, we know that no such references are
+            // live.
+            //
+            // > If `new_len` is less than `self.len`, than there must be no Rust
+            // > references referring to the memory starting at offset `new_len` and ending
+            // > at `self.len`.
+            //
+            // As per the above, there are no live references at all into the
+            // mapping.
+            unsafe {
+                self.ptr = mremap(self.ptr, self.len, new_len, MremapFlags::MAYMOVE)?;
+            }
         }
         self.len = new_len;
+        assert!(self.ptr.is_null() == (self.len == 0));
         Ok(())
     }
 }
@@ -348,95 +380,105 @@ impl Deref for Mmap {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        // SAFETY: See the `DerefMut` impl.
-        unsafe { core::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+        if self.len == 0 {
+            &[]
+        } else {
+            // SAFETY: See the `DerefMut` impl.
+            unsafe { core::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+        }
     }
 }
 
 impl DerefMut for Mmap {
     fn deref_mut(&mut self) -> &mut [u8] {
-        // SAFETY:
-        // > `ptr` must be valid for both reads and writes for `len *
-        // >  size_of::<T>()` many bytes ...
-        // > The entire memory range of this slice must be contained within a
-        // >  single allocation!
-        //
-        // The whole range comes from a single call to `mmap()` with length
-        // `len`.
-        //
-        // > `ptr` must be non-null
-        //
-        // So long as len is non-zero, `ptr` is asserted to be non-null wherever
-        // it is modified (`open()` and `resize()`).
-        //
-        // > `ptr` must be properly aligned
-        //
-        // The element type is `u8`, so `ptr` is trivially aligned.
-        //
-        // > `ptr` must point to `len` consecutive properly initialized values
-        // > of type `u8`.
-        //
-        // File-backed VMAs count as initialized.  There's no such thing as a
-        // file which contains uninitialised bytes.  (Even sparse regions are
-        // well-defined as containing zeroes.)
-        //
-        // > The memory referenced by the returned slice must not be accessed
-        // > through any other pointer (not derived from the return value) for
-        // > the duration of lifetime `'a`. Both read and write accesses are
-        // > forbidden.
-        //
-        // This is the big one.  I believe this is satisfied if both of the
-        // following hold true:
-        //
-        // * the only way to mutate the memory is via this `DerefMut` impl
-        // * the only way to read the memory is via this `DerefMut` impl or the
-        //   `Deref` impl
-        //
-        // This memory can be accessed via these impls of course, and also via
-        // operations on the underlying file. However, we can be sure that no
-        // such file operations will take place. That's because:
-        //
-        // * The file was created with `O_TMPFILE`, which means it's impossible
-        //   to create a new fd for the file via the filesystem.
-        // * We never expose our fd, which means it's impossible to create a new
-        //   fd via `clone()`.
-        // * Therefore the _only_ fd referencing the underlying file is
-        //   `self.private`.
-        // * All public methods which access the fd (self.private) take
-        //   `&mut self`.
-        // * Therefore we don't access the file via that fd while `'a` is live.
-        // * Therefore the memory can only be accessed via the mmap
-        //
-        // > The total size `len * size_of::<T>()` of the slice must be no
-        // > larger than `isize::MAX`, and adding that size to `ptr` must not
-        // > "wrap around" the address space. See the safety documentation of
-        // > [`pointer::offset`].
-        //
-        // `mmap()` puts the mapping somewhere where it fits, so
-        // `self.ptr.add(self.len)` will never overflow the address space.
-        // `self.len < isize::MAX` is asserted in open() and resize().
-        unsafe { core::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
+        if self.len == 0 {
+            &mut []
+        } else {
+            // SAFETY:
+            // > `ptr` must be valid for both reads and writes for `len *
+            // >  size_of::<T>()` many bytes ...
+            // > The entire memory range of this slice must be contained within a
+            // >  single allocation!
+            //
+            // The whole range comes from a single call to `mmap()` with length
+            // `len`.
+            //
+            // > `ptr` must be non-null
+            //
+            // So long as len is non-zero, `ptr` is asserted to be non-null wherever
+            // it is modified (`open()` and `resize()`).
+            //
+            // > `ptr` must be properly aligned
+            //
+            // The element type is `u8`, so `ptr` is trivially aligned.
+            //
+            // > `ptr` must point to `len` consecutive properly initialized values
+            // > of type `u8`.
+            //
+            // File-backed VMAs count as initialized.  There's no such thing as a
+            // file which contains uninitialised bytes.  (Even sparse regions are
+            // well-defined as containing zeroes.)
+            //
+            // > The memory referenced by the returned slice must not be accessed
+            // > through any other pointer (not derived from the return value) for
+            // > the duration of lifetime `'a`. Both read and write accesses are
+            // > forbidden.
+            //
+            // This is the big one.  I believe this is satisfied if both of the
+            // following hold true:
+            //
+            // * the only way to mutate the memory is via this `DerefMut` impl
+            // * the only way to read the memory is via this `DerefMut` impl or the
+            //   `Deref` impl
+            //
+            // This memory can be accessed via these impls of course, and also via
+            // operations on the underlying file. However, we can be sure that no
+            // such file operations will take place. That's because:
+            //
+            // * The file was created with `O_TMPFILE`, which means it's impossible
+            //   to create a new fd for the file via the filesystem.
+            // * We never expose our fd, which means it's impossible to create a new
+            //   fd via `clone()`.
+            // * Therefore the _only_ fd referencing the underlying file is
+            //   `self.private`.
+            // * All public methods which access the fd (self.private) take
+            //   `&mut self`.
+            // * Therefore we don't access the file via that fd while `'a` is live.
+            // * Therefore the memory can only be accessed via the mmap
+            //
+            // > The total size `len * size_of::<T>()` of the slice must be no
+            // > larger than `isize::MAX`, and adding that size to `ptr` must not
+            // > "wrap around" the address space. See the safety documentation of
+            // > [`pointer::offset`].
+            //
+            // `mmap()` puts the mapping somewhere where it fits, so
+            // `self.ptr.add(self.len)` will never overflow the address space.
+            // `self.len < isize::MAX` is asserted in open() and resize().
+            unsafe { core::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
+        }
     }
 }
 
 impl Drop for Mmap {
     fn drop(&mut self) {
-        // SAFETY:
-        // > `ptr` must be aligned to the applicable page size, and the range of memory
-        // > starting at `ptr` and extending for `len` bytes, rounded up to the
-        // > applicable page size, must be valid to mutate with `ptr`'s provenance.
-        //
-        // `self.ptr` comes from an mmap with length `self.len`.
-        //
-        // > And there must be no Rust references referring to that memory.
-        //
-        // The only way to get references to the mapping is via the Dered/DerefMut
-        // impls, which take borrows on the `Mmap`.  Since this method takes
-        // `&mut self`, we know that no such references are live.
-        unsafe {
-            match munmap(self.ptr, self.len) {
-                Ok(()) => (),
-                Err(e) => eprintln!("munmap failed: {e}"),
+        if self.len != 0 {
+            // SAFETY:
+            // > `ptr` must be aligned to the applicable page size, and the range of memory
+            // > starting at `ptr` and extending for `len` bytes, rounded up to the
+            // > applicable page size, must be valid to mutate with `ptr`'s provenance.
+            //
+            // `self.ptr` comes from an mmap with length `self.len`.
+            //
+            // > And there must be no Rust references referring to that memory.
+            //
+            // The only way to get references to the mapping is via the
+            // Deref/DerefMut impls, which take borrows on the `Mmap`.  Since this
+            // method takes `&mut self`, we know that no such references are live.
+            unsafe {
+                match munmap(self.ptr, self.len) {
+                    Ok(()) => (),
+                    Err(e) => eprintln!("munmap failed: {e}"),
+                }
             }
         }
     }
