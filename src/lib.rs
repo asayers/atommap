@@ -146,11 +146,17 @@ fn ficlone(fd_out: impl AsFd, fd_in: impl AsFd, len: usize) -> io::Result<bool> 
 /// simply waits for writeback to finish, and then makes the written changes
 /// visible.
 pub struct Mmap {
-    original: File,
+    original: OriginalFile,
     private: File, // Unlinked; initially a clone of `original`
     ptr: *mut c_void,
     len: usize,
-    path: Option<PathBuf>,
+}
+
+enum OriginalFile {
+    /// In this case the file is on a reflink-capable filesystem
+    Fd(File),
+    /// In this case the file is on a reflink-incapable filesystem
+    Path(PathBuf),
 }
 
 // SAFETY:
@@ -227,11 +233,14 @@ impl Mmap {
         };
         assert!(ptr.is_null() == (len == 0));
         Ok(Self {
-            original,
             private,
             ptr,
             len,
-            path: fellback.then(|| path.to_owned()),
+            original: if fellback {
+                OriginalFile::Path(path.to_owned())
+            } else {
+                OriginalFile::Fd(original)
+            },
         })
     }
 
@@ -262,8 +271,9 @@ impl Mmap {
     // and probably never will.
     pub fn commit(&mut self) -> io::Result<()> {
         self.sync()?;
-        match &self.path {
-            Some(path) => {
+        match &self.original {
+            OriginalFile::Fd(original) => ioctl_ficlone(original, &self.private)?,
+            OriginalFile::Path(path) => {
                 // We can't just copy self.private to self.original, since
                 // this would not be atomic. And we need to keep self.private
                 // unlinked. So we create a new private file, copy over the
@@ -277,7 +287,6 @@ impl Mmap {
                 ficlone(&private2, &self.private, self.len)?;
                 linkat(&private2, "", rustix::fs::CWD, path, AtFlags::EMPTY_PATH)?;
             }
-            None => ioctl_ficlone(&self.original, &self.private)?,
         }
         Ok(())
     }
@@ -286,9 +295,12 @@ impl Mmap {
     ///
     /// Atomic and O(1).
     pub fn commit_and_close(mut self) -> io::Result<()> {
-        match self.path.take() {
-            Some(path) => self.link(path),
-            None => self.commit(),
+        match &self.original {
+            OriginalFile::Fd(_) => self.commit(),
+            OriginalFile::Path(path) => {
+                let path = path.clone();
+                self.link(path)
+            }
         }
     }
 
