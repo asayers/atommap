@@ -13,7 +13,8 @@
 # let path = std::path::Path::new("/tmp/foo");
 # std::fs::write(&path, b"Hello world!")?;
 let mut mmap = Mmap::open(&path)?;
-assert_eq!(mmap.as_ref(), b"Hello world!");
+assert_eq!(mmap.len(), 12);
+assert_eq!(&mmap[..], b"Hello world!");
 mmap[6..11].copy_from_slice(b"sekai");
 mmap.commit()?;
 assert_eq!(std::fs::read_to_string(&path)?, "Hello sekai!");
@@ -85,7 +86,7 @@ use std::{
     ffi::c_void,
     fs::File,
     io,
-    ops::{Index, IndexMut},
+    ops::{Deref, DerefMut},
     os::fd::AsFd,
     path::{Path, PathBuf},
 };
@@ -119,7 +120,7 @@ fn ficlone(fd_out: impl AsFd, fd_in: impl AsFd, len: usize) -> io::Result<bool> 
 ///
 /// ## Reading
 ///
-/// Read the file contents using the `AsRef` impl.  The data you see will
+/// Read the file contents using the `Deref` impl.  The data you see will
 /// reflect the state of the file at the time `open()` was called; writes by other
 /// process are not reflected.  In other words, `Mmap` will show you a consistent
 /// point-in-time snapshot of the file.
@@ -129,7 +130,7 @@ fn ficlone(fd_out: impl AsFd, fd_in: impl AsFd, len: usize) -> io::Result<bool> 
 ///
 /// ## Writing
 ///
-/// Modify the contents using the `AsMut` impl.  Writes will not be visible
+/// Modify the contents using the `DerefMut` impl.  Writes will not be visible
 /// to other processes reading the file until you call `commit()`.  Once you
 /// call `commit()`, all your modifications will be atomically visible to other
 /// readers.  If you drop the `Mmap` without calling `commit()`, your writes
@@ -200,7 +201,7 @@ impl Mmap {
         // > preserved, including ensuring that the memory is not mutated in a way that
         // > a Rust reference would not expect.
         //
-        // See the safety comment in the AsMut impl.
+        // See the safety comment in the DerefMut impl.
         let ptr = unsafe {
             mmap(
                 std::ptr::null_mut(),
@@ -324,7 +325,7 @@ impl Mmap {
         //
         // This flag is set, so `mremap()` might move the mapping to a
         // completely new address. The only way to get references to the mapping
-        // is via the AsRef/AsMut impls, which take borrows on the `Mmap`. Since
+        // is via the Deref/DerefMut impls, which take borrows on the `Mmap`. Since
         // this method takes `&mut self`, we know that no such references are
         // live.
         //
@@ -343,34 +344,40 @@ impl Mmap {
     }
 }
 
-impl AsRef<[u8]> for Mmap {
-    fn as_ref(&self) -> &[u8] {
-        // SAFETY: See the `AsMut` impl.
+impl Deref for Mmap {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: See the `DerefMut` impl.
         unsafe { core::slice::from_raw_parts(self.ptr as *const u8, self.len) }
     }
 }
 
-impl AsMut<[u8]> for Mmap {
-    fn as_mut(&mut self) -> &mut [u8] {
+impl DerefMut for Mmap {
+    fn deref_mut(&mut self) -> &mut [u8] {
         // SAFETY:
-        // > `ptr` must be valid for both reads and writes for `len * size_of::<T>()` many bytes
-        // >  ... The entire memory range of this slice must be contained within a single allocation!
+        // > `ptr` must be valid for both reads and writes for `len *
+        // >  size_of::<T>()` many bytes ...
+        // > The entire memory range of this slice must be contained within a
+        // >  single allocation!
         //
-        // The whole range comes from a single call to `mmap()`.
+        // The whole range comes from a single call to `mmap()` with length
+        // `len`.
         //
         // > `ptr` must be non-null
         //
-        // `ptr` is asserted to be non-null wherever it is modified (`open()`
-        // and `resize()`).
+        // So long as len is non-zero, `ptr` is asserted to be non-null wherever
+        // it is modified (`open()` and `resize()`).
         //
-        // >   * `ptr` must be properly aligned
+        // > `ptr` must be properly aligned
         //
         // The element type is `u8`, so `ptr` is trivially aligned.
         //
-        // > `ptr` must point to `len` consecutive properly initialized values of type `u8`.
+        // > `ptr` must point to `len` consecutive properly initialized values
+        // > of type `u8`.
         //
         // File-backed VMAs count as initialized.  There's no such thing as a
-        // file which contains uninitialised bytes.  (Event sparse regions are
+        // file which contains uninitialised bytes.  (Even sparse regions are
         // well-defined as containing zeroes.)
         //
         // > The memory referenced by the returned slice must not be accessed
@@ -381,80 +388,34 @@ impl AsMut<[u8]> for Mmap {
         // This is the big one.  I believe this is satisfied if both of the
         // following hold true:
         //
-        // * the only way to mutate the memory is via this `AsMut` impl
-        // * the only way to read the memory is via this `AsMut` impl or the `AsRef` impl
+        // * the only way to mutate the memory is via this `DerefMut` impl
+        // * the only way to read the memory is via this `DerefMut` impl or the
+        //   `Deref` impl
         //
-        // This memory can be accessed via these impls of course, and also via operations on the underlying file.
-        // Howver, we can be sure that no such file operations will take place.
-        // That's because:
+        // This memory can be accessed via these impls of course, and also via
+        // operations on the underlying file. However, we can be sure that no
+        // such file operations will take place. That's because:
         //
         // * The file was created with `O_TMPFILE`, which means it's impossible
         //   to create a new fd for the file via the filesystem.
         // * We never expose our fd, which means it's impossible to create a new
         //   fd via `clone()`.
-        // * Therefore the _only_ fd referencing the underlying file is `self.fd`.
-        // * We don't access the file via that fd while `'a` is live (in fact,
-        //   the only use is in the `Drop` impl, where we call `close()` on it).
+        // * Therefore the _only_ fd referencing the underlying file is
+        //   `self.private`.
+        // * All public methods which access the fd (self.private) take
+        //   `&mut self`.
+        // * Therefore we don't access the file via that fd while `'a` is live.
         // * Therefore the memory can only be accessed via the mmap
         //
-        // > The total size `len * size_of::<T>()` of the slice must be no larger than `isize::MAX`,
-        // > and adding that size to `ptr` must not "wrap around" the address space.
-        // > See the safety documentation of [`pointer::offset`].
+        // > The total size `len * size_of::<T>()` of the slice must be no
+        // > larger than `isize::MAX`, and adding that size to `ptr` must not
+        // > "wrap around" the address space. See the safety documentation of
+        // > [`pointer::offset`].
         //
         // `mmap()` puts the mapping somewhere where it fits, so
         // `self.ptr.add(self.len)` will never overflow the address space.
         // `self.len < isize::MAX` is asserted in open() and resize().
         unsafe { core::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
-    }
-}
-
-impl Index<usize> for Mmap {
-    type Output = u8;
-    fn index(&self, i: usize) -> &Self::Output {
-        &self.as_ref()[i]
-    }
-}
-impl IndexMut<usize> for Mmap {
-    fn index_mut(&mut self, i: usize) -> &mut Self::Output {
-        &mut self.as_mut()[i]
-    }
-}
-
-macro_rules! index {
-    ($ty: path) => {
-        impl Index<$ty> for Mmap {
-            type Output = [u8];
-            fn index(&self, i: $ty) -> &Self::Output {
-                &self.as_ref()[i]
-            }
-        }
-        impl IndexMut<$ty> for Mmap {
-            fn index_mut(&mut self, i: $ty) -> &mut Self::Output {
-                &mut self.as_mut()[i]
-            }
-        }
-    };
-}
-
-index!(std::ops::Range<usize>);
-index!(std::ops::RangeFrom<usize>);
-index!(std::ops::RangeFull);
-index!(std::ops::RangeInclusive<usize>);
-index!(std::ops::RangeTo<usize>);
-index!(std::ops::RangeToInclusive<usize>);
-
-impl Index<(std::ops::Bound<usize>, std::ops::Bound<usize>)> for Mmap {
-    type Output = [u8];
-    fn index(&self, i: (std::ops::Bound<usize>, std::ops::Bound<usize>)) -> &Self::Output {
-        &self.as_ref()[i]
-    }
-}
-impl IndexMut<(std::ops::Bound<usize>, std::ops::Bound<usize>)> for Mmap {
-    fn index_mut(
-        &mut self,
-        i: (std::ops::Bound<usize>, std::ops::Bound<usize>),
-    ) -> &mut Self::Output {
-        &mut self.as_mut()[i]
     }
 }
 
@@ -469,7 +430,7 @@ impl Drop for Mmap {
         //
         // > And there must be no Rust references referring to that memory.
         //
-        // The only way to get references to the mapping is via the AsRef/AsMut
+        // The only way to get references to the mapping is via the Dered/DerefMut
         // impls, which take borrows on the `Mmap`.  Since this method takes
         // `&mut self`, we know that no such references are live.
         unsafe {
