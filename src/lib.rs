@@ -40,56 +40,68 @@ assert_eq!(std::fs::read_to_string(&path)?, "Hello sekai!");
 
 ## Safety
 
-The unsafe thing about mmapping a file is that what you get is volatile memory -
+The unsafe thing about mmapping a file is that it gives you _volatile memory_:
 when someone modifies the file, the memory changes.  This is not the way a
-respectable `&[u8]` should behave.
+respectable `&[u8]` (or even `&mut [u8]`) should behave.
 
-Instead of mapping the file directly, our trick is to map a private "snapshot"
-of the file which doesn't change, even when the file is modified.
-The *only* way to modify the snapshot is via the mmap,
-which makes it a valid `&mut [u8]` according to Rust's rules.
+So we use a trick: instead of mapping the file directly, we map a private
+"snapshot" of the file which doesn't change, even when the file is externally
+modified. The *only* way to modify the snapshot is via the mmap, which makes it
+valid according to Rust's rules.
+
+See the SAFETY comments in the code for a more thorough explanation.
 
 <div class="warning">
 
 There are a few crates out there which expose "safe" `mmap()` without doing
 anything to ensure that the file isn't externally modified.  These are simply
-unsound and should not be used!  If you want to risk UB, that's fine - use
-[`memmap2`](https://crates.io/crates/memmap2) and write the `unsafe` yourself.
+unsound and should not be used!  If you want to risk UB, that's OK; but it
+should be _your_ code that contains the `unsafe` keyword.
 
 </div>
 
-## OS support
+## Performance
 
-We make the snapshot by cloning the original file into an unlinked file.
+The cost of safety?
+On my machine, `Mmap::open()` takes 0.1 ms longer than `File::open()`,
+that's it, and it doesn't matter how big the file is!
+A small price to pay.
+
+But there's a catch: if the file is on a filesystem which doesn’t support
+reflinks then we have to copy the whole file.  Therefore, while the semantics
+are the same on all filesystems, the performance characteristics vary wildly.
+
+This table shows whether methods are constant-time (✅) or linear-time (⏳️) in
+the size of the file:
+
+Method | XFS | btrfs | ext4 | tmpfs
+-------|-----|-------|------|-------
+[`open()`][`Mmap::open`]                            | ✅ | ✅ | ⏳️ | ⏳️
+[`commit()`][`MmapMut::commit`]                     | ✅ | ✅ | ⏳️ | ⏳️
+[`commit_and_close()`][`MmapMut::commit_and_close`] | ✅ | ✅ | ✅ | ✅
+
+See the method docs for more details.
+
+If the file is on a reflink-capable filesystem, the overhead is so tiny that
+there's really no reason not to snapshot it.  However, although many distros
+now default to reflink-capable filesystems for new installs[^debian], it will
+obviously be common to encounter ext4 in the wild for many years to come.  So
+be aware that a subset of your users may experience stalls when mmapping large
+files.
+
+[^debian]: The major exceptions are Debian and Ubuntu, which select ext4 by
+    default in the installer.  This is, frankly, a bad decision. From its
+    creation, ext4 was intended as a "stop-gap" to give people more time to
+    migrate away from the ext* family of filesystems.  Encouraging its use on
+    fresh installs is poor.
+
+## Platform support
+
+We make the snapshot by cloning the original file into a private (unlinked) file.
 It's impossible for anyone else to modify this file, which is what makes it safe to mmap.
 On Linux we use `O_TMPFILE` for this.
 I don't know of a race-free way to create an unlinked file on MacOS/Windows;
 if one exists, please open an issue to let me know!
-
-## Performance
-
-This crate has the same semantics on all filesystems, but wildly different
-performance characteristics.  This table shows whether methods are constant-time
-(✅) or linear-time (⏳️) in the size of the file:
-
-Method | XFS | btrfs | ext4
--------|-----|-------|---------
-[`open()`][`Mmap::open`]                         | ✅ | ✅ | ⏳️
-[`commit()`][`Mmap::commit`]                     | ✅ | ✅ | ⏳️
-[`commit_and_close()`][`Mmap::commit_and_close`] | ✅ | ✅ | ✅
-
-See the method docs for more details.
-
-Although many distros now default to reflink-capable filesystems for new
-installs[^debian], it will obviously be common to encounter ext4 in the wild for
-many years to come.  Be aware that a subset of your users may experience stalls
-when mmapping large files.
-
-[^debian]: The major exceptions are Debian and Ubuntu, which select ext4 by
-    default in the installer.  This is, frankly, a bad decision on their part.
-    From its creation, ext4 was intended as a "stop-gap" to give people more
-    time to migrate away from the ext* family of filesystems.  It shouldn't be
-    used for fresh installs.
 
 */
 
@@ -355,9 +367,11 @@ enum OriginalFile {
 // SAFETY:
 // All members of `MmapMut` implement Send except for `ptr`.  `ptr`+`len` are just
 // "plain old memory" (that's the point of the trick with the private unlinked
-// file.)  So they have the same properties as Box<[u8]> wrt Send/Sync.
+// file.)  Accessing it from multiple threads is fine.
 unsafe impl Send for MmapMut {}
-// SAFETY: See above
+// SAFETY:
+// The mapping (`ptr`+`len`) is fine to read concurrently from multiple threads.
+//
 unsafe impl Sync for MmapMut {}
 
 impl MmapMut {
