@@ -12,9 +12,9 @@
 # fn foo() -> std::io::Result<()> {
 # let path = std::path::Path::new("/tmp/foo");
 # std::fs::write(&path, b"Hello world!")?;
-let mut mmap = Mmap::open(&path)?;
 assert_eq!(mmap.len(), 12);
 assert_eq!(&mmap[..], b"Hello world!");
+let mut mmap = MmapMut::open(&path)?;
 mmap[6..11].copy_from_slice(b"sekai");
 mmap.commit()?;
 assert_eq!(std::fs::read_to_string(&path)?, "Hello sekai!");
@@ -128,7 +128,7 @@ fn ficlone(fd_out: impl AsFd, fd_in: impl AsFd, len: usize) -> io::Result<bool> 
 ///
 /// Read the file contents using the `Deref` impl.  The data you see will
 /// reflect the state of the file at the time `open()` was called; writes by other
-/// process are not reflected.  In other words, `Mmap` will show you a consistent
+/// process are not reflected.  In other words, `MmapMut` will show you a consistent
 /// point-in-time snapshot of the file.
 ///
 /// Data is not loaded eagerly into memory.  It will be read in from disk on demand.
@@ -139,13 +139,13 @@ fn ficlone(fd_out: impl AsFd, fd_in: impl AsFd, len: usize) -> io::Result<bool> 
 /// Modify the contents using the `DerefMut` impl.  Writes will not be visible
 /// to other processes reading the file until you call `commit()`.  Once you
 /// call `commit()`, all your modifications will be atomically visible to other
-/// readers.  If you drop the `Mmap` without calling `commit()`, your writes
+/// readers.  If you drop the `MmapMut` without calling `commit()`, your writes
 /// will be lost!
 ///
 /// Modifications are written to disk continuously in the background; `commit()`
 /// simply waits for writeback to finish, and then makes the written changes
 /// visible.
-pub struct Mmap {
+pub struct MmapMut {
     original: OriginalFile,
     private: File, // Unlinked; initially a clone of `original`
     ptr: *mut c_void,
@@ -160,28 +160,28 @@ enum OriginalFile {
 }
 
 // SAFETY:
-// All members of `Mmap` implement Send except for `ptr`.  `ptr`+`len` are just
+// All members of `MmapMut` implement Send except for `ptr`.  `ptr`+`len` are just
 // "plain old memory" (that's the point of the trick with the private unlinked
 // file.)  So they have the same properties as Box<[u8]> wrt Send/Sync.
-unsafe impl Send for Mmap {}
+unsafe impl Send for MmapMut {}
 // SAFETY: See above
-unsafe impl Sync for Mmap {}
+unsafe impl Sync for MmapMut {}
 
-impl Mmap {
+impl MmapMut {
     /// Take a snapshot of the file and map it into memory.
     ///
     /// Note that changes to the snapshot will be discarded unless you call
-    /// [`Mmap::commit`].
+    /// [`MmapMut::commit`].
     ///
     /// # Performance
     ///
     /// If the filesystem _doesn't_ support reflinks (eg. ext4) then this
     /// will physically duplicate the file on disk.  If the file is large then
     /// clearly this will be slow and consume I/O bandwidth.  The duplicate will
-    /// be deleted when the `Mmap` is dropped.
+    /// be deleted when the `MmapMut` is dropped.
     ///
     /// If the filesystem _does_ support reflinks (XFS, btrfs) then we simply
-    /// mark the file as "copy on write" until the `Mmap` is dropped.  This is
+    /// mark the file as "copy on write" until the `MmapMut` is dropped.  This is
     /// O(1) and fast: on my machine it takes just 0.1 ms longer than a plain
     /// old `File::open()`.  Disk usage will not increase until the file is
     /// modified.
@@ -250,11 +250,11 @@ impl Mmap {
     ///
     /// # Performance
     ///
-    /// It's a similar story to [`Mmap::open()`]: if the filesystem supports
+    /// It's a similar story to [`MmapMut::open()`]: if the filesystem supports
     /// reflinks it'll be a fast O(1) (after waiting for writeback to finish);
     /// otherwise it'll be O(n).
     ///
-    /// If you're done with the file you can use [`Mmap::commit_and_close`],
+    /// If you're done with the file you can use [`MmapMut::commit_and_close`],
     /// which is always O(1).
     pub fn commit(&mut self) -> io::Result<()> {
         self.sync()?;
@@ -337,7 +337,7 @@ impl Mmap {
             }
             self.ptr = std::ptr::null_mut();
         } else if self.len == 0 {
-            // SAFETY: See Mmap::open()
+            // SAFETY: See MmapMut::open()
             unsafe {
                 self.ptr = mmap(
                     std::ptr::null_mut(),
@@ -363,7 +363,7 @@ impl Mmap {
             //
             // This flag is set, so `mremap()` might move the mapping to a
             // completely new address. The only way to get references to the mapping
-            // is via the Deref/DerefMut impls, which take borrows on the `Mmap`. Since
+            // is via the Deref/DerefMut impls, which take borrows on the `MmapMut`. Since
             // this method takes `&mut self`, we know that no such references are
             // live.
             //
@@ -405,7 +405,7 @@ fn link(fd: &File, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-impl Deref for Mmap {
+impl Deref for MmapMut {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
@@ -418,7 +418,7 @@ impl Deref for Mmap {
     }
 }
 
-impl DerefMut for Mmap {
+impl DerefMut for MmapMut {
     fn deref_mut(&mut self) -> &mut [u8] {
         if self.len == 0 {
             &mut []
@@ -488,7 +488,7 @@ impl DerefMut for Mmap {
     }
 }
 
-impl Drop for Mmap {
+impl Drop for MmapMut {
     fn drop(&mut self) {
         if self.len != 0 {
             // SAFETY:
@@ -501,7 +501,7 @@ impl Drop for Mmap {
             // > And there must be no Rust references referring to that memory.
             //
             // The only way to get references to the mapping is via the
-            // Deref/DerefMut impls, which take borrows on the `Mmap`.  Since this
+            // Deref/DerefMut impls, which take borrows on the `MmapMut`.  Since this
             // method takes `&mut self`, we know that no such references are live.
             unsafe {
                 match munmap(self.ptr, self.len) {
@@ -534,7 +534,7 @@ mod tests {
     fn mmap() -> std::io::Result<()> {
         for p in paths("mmap") {
             std::fs::write(&p, b"Hello world!")?;
-            let f = Mmap::open(&p)?;
+            let f = MmapMut::open(&p)?;
             std::fs::write(&p, b"Goodbye world!")?;
             assert_eq!(&*f, b"Hello world!");
             std::fs::remove_file(&p)?;
@@ -547,7 +547,7 @@ mod tests {
     fn mmap_mut() -> std::io::Result<()> {
         for p in paths("mmap_mut") {
             std::fs::write(&p, b"Hello world!")?;
-            let mut f = Mmap::open(&p)?;
+            let mut f = MmapMut::open(&p)?;
             assert_eq!(&*f, b"Hello world!");
             f[6..11].copy_from_slice(b"sekai");
             assert_eq!(&*f, b"Hello sekai!");
@@ -564,7 +564,7 @@ mod tests {
     fn zero_len() -> std::io::Result<()> {
         for p in paths("zero_len") {
             File::create(&p)?;
-            let f = Mmap::open(&p)?;
+            let f = MmapMut::open(&p)?;
             assert_eq!(&*f, b"");
             std::fs::remove_file(&p)?;
             assert_eq!(&*f, b"");
@@ -576,7 +576,7 @@ mod tests {
     fn zero_len_mut() -> std::io::Result<()> {
         for p in paths("zero_len_mut") {
             File::create(&p)?;
-            let mut f = Mmap::open(&p)?;
+            let mut f = MmapMut::open(&p)?;
             assert_eq!(&*f, b"");
             f.resize(12)?;
             f.copy_from_slice(b"Hello world!");
